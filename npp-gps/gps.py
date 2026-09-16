@@ -10,6 +10,7 @@
 # ///
 
 
+import json
 import logging
 import math
 import threading
@@ -20,8 +21,8 @@ from enum import Enum, Flag, auto
 from pathlib import Path
 
 import numpy as np
-import polars as pl
 from geopy.distance import geodesic
+import polars as pl
 from pupil_labs.neon_player import Plugin, action
 from pupil_labs.neon_recording import NeonRecording
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
@@ -88,6 +89,13 @@ class IMUTransforms:
         if np.ndim(imu_coords) == 1:
             return mats @ imu_coords
         return np.array([m @ c for m, c in zip(mats, imu_coords, strict=False)])
+
+    @staticmethod
+    def imu_heading_in_world(quaternions: np.ndarray) -> np.ndarray:
+        heading_neutral_in_imu_coords = np.array([0.0, 1.0, 0.0])
+        return IMUTransforms.transform_imu_to_world(
+            heading_neutral_in_imu_coords, quaternions
+        )
 
     @staticmethod
     def transform_scene_to_imu(coords: np.ndarray) -> np.ndarray:
@@ -482,7 +490,7 @@ class NativeMapView(QWidget):
                 py = -(wlat - clat) / px_deg
 
                 painter.translate(px, py)
-                painter.rotate(-self.gazi)
+                painter.rotate(self.gazi)
 
                 w = 10
                 poly = QPolygonF([
@@ -494,7 +502,7 @@ class NativeMapView(QWidget):
                 painter.setBrush(QBrush(QColor(51, 136, 255)))
                 painter.drawPolygon(poly)
 
-                painter.rotate(self.gazi)
+                painter.rotate(-self.gazi)
                 painter.translate(-px, -py)
         finally:
             painter.end()
@@ -526,6 +534,7 @@ class GPSPlugin(Plugin):
         self._tm: TileManager | None = None
 
         self._time_offset_sec = 0.0
+        self._heading_offset_deg = 0.0
         self._dock: GPSMapDock | None = None
 
         self._show_minimap = True
@@ -600,8 +609,104 @@ class GPSPlugin(Plugin):
             self._raw_gps_data = df
             self.apply_time_offset()
             logger.info(f"GPS Plugin: Loaded {len(self.gps_data)} points.")
+            self.load_heading_offset()
         except Exception:
             logger.exception("GPS load error")
+
+    def load_heading_offset(self):
+        cache_file = self.get_cache_path() / "heading_offset.json"
+        if cache_file.exists():
+            try:
+                with open(cache_file) as f:
+                    self._heading_offset_deg = json.load(f).get("offset", 0.0)
+                self.changed.emit()
+                return
+            except Exception:
+                pass
+
+        # Auto estimate if not in cache
+        df = self.gps_data
+        if df is None or len(df) < 2:
+            return
+
+        lats = df["latitude"].to_numpy()
+        lons = df["longitude"].to_numpy()
+        times = df["timestamp [ns]"].to_numpy()
+
+        start_idx = 0
+        end_idx = None
+        for i in range(1, len(lats)):
+            dlat = np.deg2rad(lats[i] - lats[start_idx])
+            dlon = np.deg2rad(lons[i] - lons[start_idx])
+            a = (
+                np.sin(dlat / 2) ** 2
+                + np.cos(np.deg2rad(lats[start_idx]))
+                * np.cos(np.deg2rad(lats[i]))
+                * np.sin(dlon / 2) ** 2
+            )
+            c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+            d = 6371000 * c
+            if d > 10.0:
+                end_idx = i
+                break
+
+        if end_idx is None:
+            return
+
+        lat1, lon1 = lats[start_idx], lons[start_idx]
+        lat2, lon2 = lats[end_idx], lons[end_idx]
+
+        dlon = np.deg2rad(lon2 - lon1)
+        lat1 = np.deg2rad(lat1)
+        lat2 = np.deg2rad(lat2)
+
+        x = np.sin(dlon) * np.cos(lat2)
+        y = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dlon)
+
+        gps_bearing = np.rad2deg(np.arctan2(x, y))
+        gps_bearing = (gps_bearing + 360) % 360
+
+        mid_t = int((times[start_idx] + times[end_idx]) // 2)
+
+        try:
+            ims = self.recording.imu.sample([mid_t])
+            if ims and ims[0]:
+                imu = ims[0]
+                q = (
+                    imu.quaternion
+                    if hasattr(imu, "quaternion")
+                    else [
+                        imu.quaternion_w,
+                        imu.quaternion_x,
+                        imu.quaternion_y,
+                        imu.quaternion_z,
+                    ]
+                )
+                cw = IMUTransforms.imu_heading_in_world(np.array([q]))[0]
+                _, ga = IMUTransforms.cartesian_to_spherical_world(np.array([cw]))
+                raw_gazi = ga[0]
+
+                # gazi is 0=North, -90=East, +90=West.
+                # Geographic is 0=North, 90=East, 270=West.
+                # imu_geo = -raw_gazi
+                # offset = gps_geo - imu_geo
+                imu_geo = -raw_gazi
+                offset_deg = gps_bearing - imu_geo
+
+                # normalize to -180..180
+                offset_deg = (offset_deg + 180) % 360 - 180
+
+                self._heading_offset_deg = offset_deg
+                logger.info(
+                    f"GPS Plugin: Auto-estimated heading offset: {offset_deg:.1f} deg"
+                )
+
+                with open(cache_file, "w") as f:
+                    json.dump({"offset": offset_deg}, f)
+
+                self.changed.emit()
+        except Exception as e:
+            logger.warning(f"GPS Plugin: Failed to auto-estimate heading: {e}")
 
     def apply_time_offset(self):
         if self._raw_gps_data is None:
@@ -695,17 +800,18 @@ class GPSPlugin(Plugin):
         )
         return l0 + f * (l1 - l0), o0 + f * (o1 - o0), idx
 
-    def get_gaze_world_azi_at_time(self, t_ns: int) -> float:
-        gs = self.recording.gaze.sample([t_ns])
+    def get_head_world_azi_at_time(self, t_ns: int) -> float:
         ims = self.recording.imu.sample([t_ns])
-        if not gs or not ims or not gs[0] or not ims[0]:
+        if not ims or not ims[0]:
             return np.nan
+            
+        imu = ims[0]
+        imu_t = getattr(imu, "time", getattr(imu, "timestamp_unix_ns", getattr(imu, "timestamp", 0)))
+        if imu_t and abs(t_ns - imu_t) > 2_000_000_000:
+            return np.nan
+            
         try:
-            g, imu = gs[0], ims[0]
-            azi = getattr(g, "azimuth", getattr(g, "azimuth_deg", 0.0))
-            ele = getattr(g, "elevation", getattr(g, "elevation_deg", 0.0))
-            cs = IMUTransforms.spherical_to_cartesian_scene(ele, azi)
-            ci = IMUTransforms.transform_scene_to_imu(cs)
+            imu = ims[0]
             q = (
                 imu.quaternion
                 if hasattr(imu, "quaternion")
@@ -716,9 +822,9 @@ class GPSPlugin(Plugin):
                     imu.quaternion_z,
                 ]
             )
-            cw = IMUTransforms.transform_imu_to_world(ci, np.array([q]))[0]
+            cw = IMUTransforms.imu_heading_in_world(np.array([q]))[0]
             _, ga = IMUTransforms.cartesian_to_spherical_world(np.array([cw]))
-            return ga[0]
+            return (-ga[0] + self._heading_offset_deg) % 360
         except Exception:
             return np.nan
 
@@ -852,8 +958,12 @@ class GPSPlugin(Plugin):
 
         clat, clon, current_idx = pos_data
 
-        gazi = self.get_gaze_world_azi_at_time(time_ns)
-        gazi = 0 if np.isnan(gazi) else gazi
+        gazi = self.get_head_world_azi_at_time(time_ns)
+        if np.isnan(gazi):
+            if "bearing" in self.gps_data.columns:
+                gazi = float(self.gps_data["bearing"][current_idx])
+            else:
+                gazi = 0.0
 
         if self._dock is not None:
             try:
@@ -1168,6 +1278,28 @@ class GPSPlugin(Plugin):
                 Qt.DockWidgetArea.RightDockWidgetArea, self._dock
             )
             self._dock.show()
+
+    @property
+    @property_params(
+        label="Heading Offset (deg)",
+        min=-180.0,
+        max=180.0,
+        step=1.0,
+        description="Manual heading calibration.",
+    )
+    def heading_offset_deg(self) -> float:
+        return self._heading_offset_deg
+
+    @heading_offset_deg.setter
+    def heading_offset_deg(self, v: float):
+        self._heading_offset_deg = float(v)
+        cache_file = self.get_cache_path() / "heading_offset.json"
+        try:
+            with open(cache_file, "w") as f:
+                json.dump({"offset": self._heading_offset_deg}, f)
+        except Exception:
+            pass
+        self.changed.emit()
 
     @property
     @property_params(
